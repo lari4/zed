@@ -465,3 +465,342 @@ Tool calls have been disabled. You MUST respond using the SEARCH/REPLACE diff fo
 
 ---
 
+## Evaluation Prompts
+
+### Diff Judge Prompt
+
+**Purpose:** Evaluates a code diff against multiple assertions, providing both detailed analysis and a numeric score (0-100). Used for assessing whether changes meet specified requirements.
+
+**Location:** `crates/agent/src/templates/diff_judge.hbs`
+
+**Template Variables:**
+- `diff` - The code diff to evaluate
+- `assertions` - List of assertions to check
+
+**Prompt:**
+
+```handlebars
+You are an expert coder, and have been tasked with looking at the following diff:
+
+<diff>
+{{diff}}
+</diff>
+
+Evaluate the following assertions:
+
+<assertions>
+{{assertions}}
+</assertions>
+
+You must respond with a short analysis and a score between 0 and 100, where:
+- 0 means no assertions pass
+- 100 means all the assertions pass perfectly
+
+<analysis>
+- Assertion 1: one line describing why the first assertion passes or fails (even partially)
+- Assertion 2: one line describing why the second assertion passes or fails (even partially)
+- ...
+- Assertion N: one line describing why the Nth assertion passes or fails (even partially)
+</analysis>
+<score>YOUR FINAL SCORE HERE</score>
+```
+
+---
+
+### Judge Diff with Assertion
+
+**Purpose:** Evaluates a repository diff against a single assertion in the context of the original prompt. Returns structured XML output with true/false pass status.
+
+**Location:** `crates/eval/src/judge_diff_prompt.hbs`
+
+**Template Variables:**
+- `prompt` - The original prompt that generated the diff
+- `repository_diff` - The diff to evaluate
+- `assertion` - Single assertion to check
+
+**Prompt:**
+
+```handlebars
+You are an expert software developer. Your task is to evaluate a diff produced by an AI agent
+in response to a prompt. Here is the prompt and the diff:
+
+<prompt>
+{{{prompt}}}
+</prompt>
+
+<diff>
+{{{repository_diff}}}
+</diff>
+
+Evaluate whether or not the diff passes the following assertion:
+
+<assertion>
+{{assertion}}
+</assertion>
+
+Analyze the diff hunk by hunk, and structure your answer in the following XML format:
+
+```
+<analysis>{YOUR ANALYSIS HERE}</analysis>
+<passed>{PASSED_ASSERTION}</passed>
+```
+
+Where `PASSED_ASSERTION` is either `true` or `false`.
+```
+
+---
+
+### Judge Thread Prompt
+
+**Purpose:** Evaluates an AI agent's conversation thread (messages and tool calls) against an assertion. Useful for validating agent behavior and decision-making processes.
+
+**Location:** `crates/eval/src/judge_thread_prompt.hbs`
+
+**Template Variables:**
+- `messages` - The conversation messages to evaluate
+- `assertion` - Assertion about agent behavior
+
+**Prompt:**
+
+```handlebars
+You are an expert software developer.
+Your task is to evaluate an AI agent's messages and tool calls in this conversation:
+
+<messages>
+{{{messages}}}
+</messages>
+
+Evaluate whether or not the sequence of messages passes the following assertion:
+
+<assertion>
+{{{assertion}}}
+</assertion>
+
+Analyze the messages one by one, and structure your answer in the following XML format:
+
+```
+<analysis>{YOUR ANALYSIS HERE}</analysis>
+<passed>{PASSED_ASSERTION}</passed>
+```
+
+Where `PASSED_ASSERTION` is either `true` or `false`.
+```
+
+---
+
+## Assistant Prompts
+
+### Content/Inline Edit Prompt
+
+**Purpose:** Powers inline code and text editing within the editor. Handles both insertion mode (adding new code) and rewrite mode (modifying existing code). Includes support for diagnostic errors and maintains proper indentation.
+
+**Location:** `assets/prompts/content_prompt.hbs`
+
+**Template Variables:**
+- `language_name` - Programming language (optional)
+- `is_insert` - Whether this is an insertion (vs rewrite)
+- `is_truncated` - Whether context was truncated
+- `document_content` - The file content with markers
+- `user_prompt` - User's request
+- `content_type` - Type of content (code, text, etc.)
+- `rewrite_section` - Section to be rewritten (if applicable)
+- `diagnostic_errors` - List of diagnostic errors with line numbers
+
+**Prompt:**
+
+```handlebars
+{{#if language_name}}
+Here's a file of {{language_name}} that I'm going to ask you to make an edit to.
+{{else}}
+Here's a file of text that I'm going to ask you to make an edit to.
+{{/if}}
+
+{{#if is_insert}}
+The point you'll need to insert at is marked with <insert_here></insert_here>.
+{{else}}
+The section you'll need to rewrite is marked with <rewrite_this></rewrite_this> tags.
+{{/if}}
+
+<document>
+{{{document_content}}}
+</document>
+
+{{#if is_truncated}}
+The context around the relevant section has been truncated (possibly in the middle of a line) for brevity.
+{{/if}}
+
+{{#if is_insert}}
+You can't replace {{content_type}}, your answer will be inserted in place of the `<insert_here></insert_here>` tags. Don't include the insert_here tags in your output.
+
+Generate {{content_type}} based on the following prompt:
+
+<prompt>
+{{{user_prompt}}}
+</prompt>
+
+Match the indentation in the original file in the inserted {{content_type}}, don't include any indentation on blank lines.
+
+Return ONLY the {{content_type}} to insert. Do NOT include any XML tags like <document>, <insert_here>, or any surrounding markup from the input.
+
+Respond with a code block containing the {{content_type}} to insert. Replace \{{INSERTED_CODE}} with your actual {{content_type}}:
+
+```
+\{{INSERTED_CODE}}
+```
+{{else}}
+Edit the section of {{content_type}} in <rewrite_this></rewrite_this> tags based on the following prompt:
+
+<prompt>
+{{{user_prompt}}}
+</prompt>
+
+{{#if rewrite_section}}
+And here's the section to rewrite based on that prompt again for reference:
+
+<rewrite_this>
+{{{rewrite_section}}}
+</rewrite_this>
+
+{{#if diagnostic_errors}}
+Below are the diagnostic errors visible to the user.  If the user requests problems to be fixed, use this information, but do not try to fix these errors if the user hasn't asked you to.
+
+{{#each diagnostic_errors}}
+<diagnostic_error>
+    <line_number>{{line_number}}</line_number>
+    <error_message>{{error_message}}</error_message>
+    <code_content>{{code_content}}</code_content>
+</diagnostic_error>
+{{/each}}
+{{/if}}
+
+{{/if}}
+
+Only make changes that are necessary to fulfill the prompt, leave everything else as-is. All surrounding {{content_type}} will be preserved.
+
+Start at the indentation level in the original file in the rewritten {{content_type}}. Don't stop until you've rewritten the entire section, even if you have no more changes to make, always write out the whole section with no unnecessary elisions.
+
+Return ONLY the rewritten {{content_type}}. Do NOT include any XML tags like <document>, <rewrite_this>, or any surrounding markup from the input.
+
+Respond with a code block containing the rewritten {{content_type}}. Replace \{{REWRITTEN_CODE}} with your actual rewritten {{content_type}}:
+
+```
+\{{REWRITTEN_CODE}}
+```
+{{/if}}
+```
+
+---
+
+### Terminal Assistant Prompt
+
+**Purpose:** Generates shell commands based on natural language descriptions. Takes into account the current OS, architecture, shell type, working directory, and recent terminal output.
+
+**Location:** `assets/prompts/terminal_assistant_prompt.hbs`
+
+**Template Variables:**
+- `os` - Operating system name
+- `arch` - System architecture
+- `shell` - Current shell (optional)
+- `working_directory` - Current directory (optional)
+- `latest_output` - Recent terminal output (optional)
+- `user_prompt` - User's command description
+
+**Prompt:**
+
+```handlebars
+You are an expert terminal user.
+You will be given a description of a command and you need to respond with a command that matches the description.
+Do not include markdown blocks or any other text formatting in your response, always respond with a single command that can be executed in the given shell.
+Current OS name is '{{os}}', architecture is '{{arch}}'.
+{{#if shell}}
+Current shell is '{{shell}}'.
+{{/if}}
+{{#if working_directory}}
+Current working directory is '{{working_directory}}'.
+{{/if}}
+{{#if latest_output}}
+Latest non-empty terminal output:
+{{#each latest_output as |line|}}
+{{line}}
+{{/each}}
+{{/if}}
+Here is the description of the command:
+{{{user_prompt}}}
+```
+
+---
+
+## Summary Prompts
+
+### Thread Title Summary
+
+**Purpose:** Generates a concise 3-7 word title for a conversation thread. Used for naming and organizing conversation history.
+
+**Location:** `crates/agent_settings/src/prompts/summarize_thread_prompt.txt`
+
+**Template Variables:** None (uses conversation context)
+
+**Prompt:**
+
+```text
+Generate a concise 3-7 word title for this conversation, omitting punctuation.
+Go straight to the title, without any preamble and prefix like `Here's a concise suggestion:...` or `Title:`.
+If the conversation is about a specific subject, include it in the title.
+Be descriptive. DO NOT speak in the first person.
+```
+
+---
+
+### Detailed Thread Summary
+
+**Purpose:** Creates a comprehensive markdown-formatted summary of a conversation, including overview, key facts, outcomes, and action items.
+
+**Location:** `crates/agent_settings/src/prompts/summarize_thread_detailed_prompt.txt`
+
+**Template Variables:** None (uses conversation context)
+
+**Prompt:**
+
+```text
+Generate a detailed summary of this conversation. Include:
+1. A brief overview of what was discussed
+2. Key facts or information discovered
+3. Outcomes or conclusions reached
+4. Any action items or next steps if any
+Format it in Markdown with headings and bullet points.
+```
+
+---
+
+### Git Commit Message Prompt
+
+**Purpose:** Generates well-formatted Git commit messages following best practices. Creates concise subject lines with optional body text for complex changes.
+
+**Location:** `crates/git_ui/src/commit_message_prompt.txt`
+
+**Template Variables:** None (uses diff context)
+
+**Prompt:**
+
+```text
+You are an expert at writing Git commits. Your job is to write a short clear commit message that summarizes the changes.
+
+If you can accurately express the change in just the subject line, don't include anything in the message body. Only use the body when it is providing *useful* information.
+
+Don't repeat information from the subject line in the message body.
+
+Only return the commit message in your response. Do not include any additional meta-commentary about the task. Do not include the raw diff output in the commit message.
+
+Follow good Git style:
+
+- Separate the subject from the body with a blank line
+- Try to limit the subject line to 50 characters
+- Capitalize the subject line
+- Do not end the subject line with any punctuation
+- Use the imperative mood in the subject line
+- Wrap the body at 72 characters
+- Keep the body short and concise (omit it entirely if not useful)
+```
+
+---
+
