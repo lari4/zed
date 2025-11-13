@@ -550,3 +550,643 @@ Old Text Chunks (streaming)
 
 ---
 
+## Tool Execution Pipeline
+
+### Overview
+
+Tools extend the agent's capabilities by allowing it to interact with the file system, terminal, web, and other resources. The tool execution pipeline handles tool discovery, selection, invocation, and result integration back into the conversation.
+
+**Primary File:** `crates/agent/src/tools.rs` and individual tool implementations in `crates/agent/src/tools/`
+
+**Key Components:**
+- `AgentTool` trait - Defines tool interface
+- `AnyAgentTool` - Type-erased tool wrapper
+- `ToolCallEventStream` - Reports tool execution progress to UI
+- `ContextServerRegistry` - Manages external MCP tools
+
+### Tool Availability and Filtering
+
+```
+┌───────────────────────────────────────────────────────────┐
+│           Thread::enabled_tools(profile, model, cx)       │
+│                                                           │
+│  Step 1: Gather Built-in Tools                           │
+│  ┌─────────────────────────────────────────────────┐    │
+│  │ Available Built-in Tools:                       │    │
+│  │  ✓ CopyPathTool       ✓ ListDirectoryTool      │    │
+│  │  ✓ CreateDirectoryTool ✓ MovePathTool          │    │
+│  │  ✓ DeletePathTool     ✓ NowTool                │    │
+│  │  ✓ DiagnosticsTool    ✓ OpenTool               │    │
+│  │  ✓ EditFileTool       ✓ ReadFileTool           │    │
+│  │  ✓ FetchTool          ✓ TerminalTool           │    │
+│  │  ✓ FindPathTool       ✓ ThinkingTool           │    │
+│  │  ✓ GrepTool           ✓ WebSearchTool          │    │
+│  └─────────────────────────────────────────────────┘    │
+│          │                                               │
+│          ▼                                               │
+│  Filter by provider compatibility:                       │
+│    └─ tool.supports_provider(&model.provider_id())       │
+│          │                                               │
+│          ▼                                               │
+│  Filter by profile settings:                             │
+│    └─ profile.is_tool_enabled(tool_name)                │
+│                                                           │
+│  Step 2: Add Context Server Tools                        │
+│  ┌─────────────────────────────────────────────────┐    │
+│  │ Get running servers from registry               │    │
+│  │  └─ For each server:                            │    │
+│  │     └─ For each tool in server.tools:           │    │
+│  │        └─ Check: profile.is_context_server_     │    │
+│  │                  tool_enabled(server_id, name)  │    │
+│  └─────────────────────────────────────────────────┘    │
+│          │                                               │
+│          ▼                                               │
+│  Step 3: Handle Name Collisions                          │
+│    ├─ Track duplicate names in HashSet                  │
+│    └─ Disambiguate with server_id prefix               │
+│       (if name + prefix <= 64 chars)                    │
+│                                                           │
+│  Output: BTreeMap<SharedString, Arc<dyn AnyAgentTool>>  │
+└───────────────────────────────────────────────────────────┘
+```
+
+### Tool Execution Flow
+
+```
+┌───────────────────────────────────┐
+│  Model Output: ToolUse Event      │
+│  {                                │
+│    id: ToolUseId,                 │
+│    name: "read_file",             │
+│    input: {"path": "src/main.rs"},│
+│    is_input_complete: true        │
+│  }                                │
+└────────┬──────────────────────────┘
+         │
+         ▼
+┌───────────────────────────────────────────────────────────┐
+│      Thread::handle_tool_use_event()                     │
+│                                                           │
+│  1. Wait for complete input:                             │
+│     └─ If !is_input_complete, buffer and wait            │
+│                                                           │
+│  2. Lookup tool by name:                                 │
+│     ├─ Check self.tools (built-in)                       │
+│     └─ Check registry.servers() (context servers)        │
+│                                                           │
+│  3. If tool not found:                                   │
+│     └─ Return LanguageModelToolResult with error:        │
+│        "No tool named 'X' exists"                        │
+│                                                           │
+│  4. If tool found:                                       │
+│     ├─ Create ToolCallEventStream (for UI updates)       │
+│     ├─ Set initial status: InProgress                    │
+│     ├─ Parse input JSON to tool's Input type             │
+│     └─ Spawn foreground task:                            │
+│        tool.run(input, event_stream, cx)                 │
+└────────┬──────────────────────────────────────────────────┘
+         │
+         ▼
+┌────────────────────────────────────────────────────────────┐
+│              Tool Implementation                           │
+│              (e.g., ReadFileTool)                          │
+│                                                            │
+│  async fn run(input, event_stream, cx) -> Result<Output>  │
+│  {                                                         │
+│    ├─ Perform operations:                                 │
+│    │  - Read file, execute command, search web, etc.      │
+│    │                                                       │
+│    ├─ Emit events to event_stream:                        │
+│    │  event_stream.send(ToolCallEvent::Output { ... })    │
+│    │  └─> UI updates in real-time                         │
+│    │                                                       │
+│    └─ Return result:                                      │
+│       Ok(LanguageModelToolResultContent::Text(content))   │
+│  }                                                         │
+└────────┬───────────────────────────────────────────────────┘
+         │
+         ▼
+┌──────────────────────────────────────────────────────────┐
+│         Wrap Result in LanguageModelToolResult          │
+│         {                                                │
+│           tool_use_id: id,                               │
+│           tool_name: "read_file",                        │
+│           is_error: false,                               │
+│           content: ToolResultContent::Text(file_content),│
+│           output: debug JSON                             │
+│         }                                                │
+└────────┬─────────────────────────────────────────────────┘
+         │
+         ▼
+┌──────────────────────────────────────────────────────────┐
+│     Add to pending_message.tool_results                 │
+└────────┬─────────────────────────────────────────────────┘
+         │
+         ▼
+┌──────────────────────────────────────────────────────────┐
+│     If StopReason::ToolUse:                             │
+│       ├─ pending_message.to_request() creates:          │
+│       │  ├─ Assistant message with ToolUse content       │
+│       │  └─ User message with ToolResult content         │
+│       │                                                   │
+│       └─ Send back to model for next iteration           │
+└────────┬─────────────────────────────────────────────────┘
+         │
+         ▼
+┌─────────────────────┐
+│  Model processes    │
+│  tool results and   │
+│  continues response │
+└─────────────────────┘
+```
+
+### Tool Trait Interface
+
+```rust
+pub trait AgentTool where Self: 'static + Sized {
+    // Input/output types
+    type Input: Deserialize + Serialize + JsonSchema;
+    type Output: Deserialize + Serialize + Into<LanguageModelToolResultContent>;
+
+    // Metadata
+    fn name() -> &'static str;
+    fn description() -> SharedString;
+    fn kind() -> acp::ToolKind;
+
+    // Schema and compatibility
+    fn input_schema(format: LanguageModelToolSchemaFormat) -> Schema;
+    fn supports_provider(provider: &LanguageModelProviderId) -> bool;
+
+    // UI and execution
+    fn initial_title(input: Result<Self::Input, Value>, cx: &mut App) -> SharedString;
+    fn run(self: Arc<Self>,
+           input: Self::Input,
+           event_stream: ToolCallEventStream,
+           cx: &mut App) -> Task<Result<Self::Output>>;
+    fn replay(input: Self::Input,
+              output: Self::Output,
+              event_stream: ToolCallEventStream,
+              cx: &mut App) -> Result<()>;
+}
+```
+
+### Prompts Used
+
+- **System Prompt** includes tool descriptions and schemas
+  - Tool list rendered in `## Tool Use` section
+  - Each tool gets: name, description, JSON schema
+  - See [System Prompt Construction Pipeline](#system-prompt-construction-pipeline)
+
+### Data Transformations
+
+| From | To | Transformation |
+|------|-----|----------------|
+| Tool metadata | JSON Schema | `tool.input_schema()` generates schema |
+| `LanguageModelToolUse` | Parsed input | Deserialize JSON to tool's Input type |
+| Tool output | `ToolResultContent` | `Into<LanguageModelToolResultContent>` |
+| Tool result | Model message | Wrapped in User message with ToolResult role |
+
+### Key Functions
+
+- `Thread::enabled_tools()` (lines 1896-1962) - Filters and collects available tools
+- `Thread::handle_tool_use_event()` (lines 1500-1608) - Initiates tool execution
+- `AgentTool::run()` - Tool implementation (varies by tool)
+- `ToolCallEventStream::send()` - Reports progress to UI
+
+---
+
+## Context Retrieval Pipeline
+
+### Overview
+
+The context retrieval pipeline gathers project information, custom rules, and user preferences to include in the system prompt. This provides the agent with awareness of the project structure, conventions, and user requirements.
+
+**Primary Files:**
+- `crates/agent/src/agent.rs` (lines 384-529)
+- `crates/prompt_store/src/prompts.rs`
+- `crates/prompt_store/src/prompt_store.rs`
+
+**Key Components:**
+- `ProjectContext` - Aggregates all project-level context
+- `WorktreeContext` - Information for each workspace root
+- `PromptStore` - Manages user-defined custom prompts
+
+### ProjectContext Construction Flow
+
+```
+┌───────────────────────────────────────────────────────────┐
+│    NativeAgent::build_project_context()                   │
+│    (Spawned as async task)                                │
+└────────┬──────────────────────────────────────────────────┘
+         │
+         ├─────────────────────────┬─────────────────────────┐
+         │                         │                         │
+         ▼                         ▼                         ▼
+┌──────────────────┐   ┌──────────────────┐   ┌──────────────────┐
+│  Worktree 1      │   │  Worktree 2      │   │  Worktree N      │
+│  Context         │   │  Context         │   │  Context         │
+│                  │   │                  │   │                  │
+│ ┌──────────────┐ │   │ ┌──────────────┐ │   │ ┌──────────────┐ │
+│ │ Root name:   │ │   │ │ Root name:   │ │   │ │ Root name:   │ │
+│ │  "zed"       │ │   │ │  "extension" │ │   │ │  "docs"      │ │
+│ └──────────────┘ │   │ └──────────────┘ │   │ └──────────────┘ │
+│                  │   │                  │   │                  │
+│ ┌──────────────┐ │   │ ┌──────────────┐ │   │ ┌──────────────┐ │
+│ │ Abs path:    │ │   │ │ Abs path:    │ │   │ │ Abs path:    │ │
+│ │  /home/user/ │ │   │ │  /home/user/ │ │   │ │  /home/user/ │ │
+│ │  zed         │ │   │ │  ext         │ │   │ │  docs        │ │
+│ └──────────────┘ │   │ └──────────────┘ │   │ └──────────────┘ │
+│                  │   │                  │   │                  │
+│ ┌──────────────┐ │   │ ┌──────────────┐ │   │ ┌──────────────┐ │
+│ │ Rules file:  │ │   │ │ Rules file:  │ │   │ │ Rules file:  │ │
+│ │  Search for: │ │   │ │  Search for: │ │   │ │  Search for: │ │
+│ │  - .rules    │ │   │ │  - .rules    │ │   │ │  - .rules    │ │
+│ │  - .cursor*  │ │   │ │  - .cursor*  │ │   │ │  - .cursor*  │ │
+│ │  - CLAUDE.md │ │   │ │  - CLAUDE.md │ │   │ │  - CLAUDE.md │ │
+│ │  - etc.      │ │   │ │  - etc.      │ │   │ │  - etc.      │ │
+│ │              │ │   │ │              │ │   │ │              │ │
+│ │ → Found:     │ │   │ │ → Found:     │ │   │ │ → None found │ │
+│ │   CLAUDE.md  │ │   │ │   .rules     │ │   │ │              │ │
+│ └──────────────┘ │   │ └──────────────┘ │   │ └──────────────┘ │
+└──────────────────┘   └──────────────────┘   └──────────────────┘
+         │                         │                         │
+         └─────────────────────────┴─────────────────────────┘
+                                   │
+                                   ▼
+         ┌─────────────────────────────────────────────────────┐
+         │      Load User Default Prompts                      │
+         │      (from PromptStore)                             │
+         │                                                     │
+         │  prompt_store.default_prompt_metadata()             │
+         │    └─ For each default prompt:                     │
+         │       ├─ Load prompt title and contents            │
+         │       └─ Wrap in UserRulesContext                  │
+         └─────────────────────────────────────────────────────┘
+                                   │
+                                   ▼
+         ┌─────────────────────────────────────────────────────┐
+         │      Combine into ProjectContext                    │
+         │      {                                              │
+         │        worktrees: Vec<WorktreeContext>,             │
+         │        has_rules: bool,                             │
+         │        user_rules: Vec<UserRulesContext>,           │
+         │        has_user_rules: bool,                        │
+         │        os: String,                                  │
+         │        shell: String                                │
+         │      }                                              │
+         └─────────────────────────────────────────────────────┘
+                                   │
+                                   ▼
+         ┌─────────────────────────────────────────────────────┐
+         │      Store in NativeAgent.project_context           │
+         │      (watch::channel for updates)                   │
+         └─────────────────────────────────────────────────────┘
+```
+
+### Rules File Search Order
+
+The agent searches for rules files in this order (first match wins):
+
+```
+RULES_FILE_NAMES = [
+  ".rules",
+  ".cursorrules",
+  ".windsurfrules",
+  ".clinerules",
+  ".github/copilot-instructions.md",
+  "CLAUDE.md",
+  "AGENT.md",
+  "AGENTS.md",
+  "GEMINI.md"
+]
+```
+
+### Context Update Triggers
+
+The ProjectContext is automatically rebuilt when:
+
+```
+┌──────────────────────────────────────────┐
+│  Project Events                          │
+├──────────────────────────────────────────┤
+│  • WorktreeAdded                         │
+│  • WorktreeRemoved                       │
+│  • WorktreeUpdatedEntries (if rules file)│
+└────────┬─────────────────────────────────┘
+         │
+         ▼
+┌──────────────────────────────────────────┐
+│  PromptStore Events                      │
+├──────────────────────────────────────────┤
+│  • PromptsUpdatedEvent                   │
+└────────┬─────────────────────────────────┘
+         │
+         ▼
+┌──────────────────────────────────────────┐
+│  Rebuild ProjectContext                  │
+│  • Spawns async task                     │
+│  • Updates watch::channel                │
+│  • Next conversation turn uses new ctx   │
+└──────────────────────────────────────────┘
+```
+
+### Message Context Mentions
+
+User messages can include mentions that add context:
+
+```
+User Input: "@src/main.rs Fix the bug in #calculate_total"
+                ↓
+┌────────────────────────────────────────────────────────┐
+│  Parse Mentions:                                       │
+│  ├─ File: src/main.rs                                  │
+│  └─ Symbol: #calculate_total                           │
+└────────┬───────────────────────────────────────────────┘
+         │
+         ▼
+┌────────────────────────────────────────────────────────┐
+│  Resolve and Format:                                   │
+│                                                        │
+│  <context>                                             │
+│  <files>                                               │
+│  ```src/main.rs#L1-50                                  │
+│  fn calculate_total(price: f64, qty: i32) -> f64 {    │
+│    // ... file contents ...                            │
+│  }                                                      │
+│  ```                                                   │
+│  </files>                                              │
+│                                                        │
+│  <symbols>                                             │
+│  ```src/main.rs#L42-48                                 │
+│  fn calculate_total(price: f64, qty: i32) -> f64 {    │
+│    price * qty as f64                                  │
+│  }                                                      │
+│  ```                                                   │
+│  </symbols>                                            │
+│  </context>                                            │
+└────────────────────────────────────────────────────────┘
+```
+
+### Mention Types and Formatting
+
+| Mention Type | Context Section | Format |
+|--------------|-----------------|--------|
+| File URI | `<files>` | Markdown code block with file path |
+| Directory | `<directories>` | Plain text path |
+| Symbol | `<symbols>` | Markdown code block with path:line |
+| Selection | `<selections>` | Markdown code block with path:line |
+| Thread | `<threads>` | Plain text reference |
+| Fetch URL | `<fetched_urls>` | URL + fetched content |
+| Rule | `<user_rules>` | Code block with rule content |
+
+### Prompts Used
+
+- Custom rules files (`.rules`, `CLAUDE.md`, etc.) are included in system prompt
+- User default prompts from PromptStore included as user rules
+- See [System Prompt Construction Pipeline](#system-prompt-construction-pipeline)
+
+### Key Functions
+
+- `NativeAgent::build_project_context()` (lines 384-450) - Main builder
+- `load_worktree_info_for_system_prompt()` (lines 452-500) - Per-worktree info
+- `load_worktree_rules_file()` (lines 502-529) - Rules file loading
+- `maintain_project_context()` (lines 568-598) - Auto-update task
+- `UserMessage::to_context_section()` (thread.rs lines 200-354) - Formats mentions
+
+---
+
+## System Prompt Construction Pipeline
+
+### Overview
+
+The system prompt is the foundation of every conversation turn, providing the agent with its identity, capabilities, project context, and user instructions. It's constructed by rendering the `system_prompt.hbs` template with rich contextual data.
+
+**Primary Files:**
+- `crates/agent/src/templates/system_prompt.hbs` - Template
+- `crates/agent/src/templates.rs` - Template rendering
+- `crates/agent/src/thread.rs` (lines 1968-1990) - Template data preparation
+
+### Construction Flow
+
+```
+┌───────────────────────────────────────────────────────────┐
+│         Thread::build_request_messages()                  │
+│         (Called on every turn)                            │
+└────────┬──────────────────────────────────────────────────┘
+         │
+         ▼
+┌───────────────────────────────────────────────────────────┐
+│         Prepare Template Data                             │
+│                                                           │
+│  ProjectContext (from NativeAgent):                       │
+│    ├─ worktrees: Vec<WorktreeContext>                    │
+│    │  └─ For each worktree:                              │
+│    │     ├─ root_name: String                            │
+│    │     ├─ abs_path: Arc<Path>                          │
+│    │     └─ rules_file: Option<RulesFileContext>         │
+│    │        ├─ path_in_worktree: Arc<RelPath>            │
+│    │        └─ text: String                              │
+│    │                                                      │
+│    ├─ has_rules: bool                                    │
+│    ├─ user_rules: Vec<UserRulesContext>                  │
+│    │  └─ For each prompt:                                │
+│    │     ├─ title: Option<String>                        │
+│    │     └─ contents: String                             │
+│    │                                                      │
+│    ├─ has_user_rules: bool                               │
+│    ├─ os: String (e.g., "Linux", "macOS")               │
+│    └─ shell: String (e.g., "bash", "zsh")               │
+│                                                           │
+│  Available Tools:                                         │
+│    └─ available_tools: Vec<SharedString>                 │
+│       (tool names from enabled_tools)                    │
+│                                                           │
+│  Model Information:                                       │
+│    └─ model_name: Option<String>                         │
+│       (e.g., "claude-opus-4-20250514")                   │
+└────────┬──────────────────────────────────────────────────┘
+         │
+         ▼
+┌───────────────────────────────────────────────────────────┐
+│         Render Template: system_prompt.hbs                │
+│         (via Handlebars)                                  │
+└────────┬──────────────────────────────────────────────────┘
+         │
+         ▼
+┌───────────────────────────────────────────────────────────┐
+│         Generated System Prompt Structure                 │
+│                                                           │
+│  1. Identity and Communication                            │
+│     └─ "You are a highly skilled software engineer..."   │
+│                                                           │
+│  2. Tool Use Instructions (if tools available)            │
+│     ├─ Tool schema adherence                             │
+│     ├─ Required vs available tools                       │
+│     └─ Tool-specific guidelines                          │
+│                                                           │
+│  3. Searching and Reading (if tools available)            │
+│     ├─ Project root directories list                     │
+│     ├─ File path guidelines                              │
+│     └─ grep tool recommendations                         │
+│                                                           │
+│  4. Code Block Formatting                                 │
+│     ├─ Path-based format requirement                     │
+│     ├─ Examples of correct format                        │
+│     └─ Examples of incorrect formats to avoid            │
+│                                                           │
+│  5. Fixing Diagnostics (if tools available)               │
+│     └─ Guidelines for diagnostic resolution              │
+│                                                           │
+│  6. Debugging (if tools available)                        │
+│     └─ Best practices for debugging                      │
+│                                                           │
+│  7. Calling External APIs                                 │
+│     └─ API usage and security guidelines                 │
+│                                                           │
+│  8. System Information                                    │
+│     ├─ Operating System: {{os}}                          │
+│     └─ Default Shell: {{shell}}                          │
+│                                                           │
+│  9. Model Information (if available)                      │
+│     └─ "You are powered by {{model_name}}"               │
+│                                                           │
+│  10. User's Custom Instructions (if available)            │
+│      ├─ Project rules from rules files                   │
+│      └─ User default prompts from PromptStore            │
+└───────────────────────────────────────────────────────────┘
+         │
+         ▼
+┌───────────────────────────────────────────────────────────┐
+│         Add to LanguageModelRequest                       │
+│         messages[0] = System message (rendered prompt)    │
+└───────────────────────────────────────────────────────────┘
+```
+
+### Template Conditional Sections
+
+The system prompt adapts based on available data:
+
+```
+{{#if (gt (len available_tools) 0)}}
+  ## Tool Use
+  [Tool usage instructions]
+
+  ## Searching and Reading
+  [File search guidelines]
+  {{#if (contains available_tools 'grep')}}
+    [grep-specific recommendations]
+  {{/if}}
+
+  ## Fixing Diagnostics
+  [Diagnostic handling]
+
+  ## Debugging
+  [Debugging guidelines]
+{{else}}
+  [No-tools mode instructions]
+{{/if}}
+
+{{#if model_name}}
+  ## Model Information
+  You are powered by {{model_name}}
+{{/if}}
+
+{{#if (or has_rules has_user_rules)}}
+  ## User's Custom Instructions
+
+  {{#if has_rules}}
+    [Project rules from worktrees]
+  {{/if}}
+
+  {{#if has_user_rules}}
+    [User default prompts]
+  {{/if}}
+{{/if}}
+```
+
+### Example Rendered Sections
+
+**Project Roots:**
+```markdown
+If appropriate, use tool calls to explore the current project, which contains the following root directories:
+
+- `/home/user/zed`
+- `/home/user/zed-extensions`
+```
+
+**Custom Rules:**
+```markdown
+## User's Custom Instructions
+
+There are project rules that apply to these root directories:
+`zed/CLAUDE.md`:
+``````
+# Rust coding guidelines
+* Prioritize code correctness and clarity.
+* Do not write organizational comments.
+...
+``````
+```
+
+**Available Tools:**
+```markdown
+## Tool Use
+
+1. Make sure to adhere to the tools schema.
+2. Provide every required argument.
+3. DO NOT use tools to access items that are already available in the context section.
+...
+```
+
+### Template Rendering Process
+
+```
+Template Variables (HashMap)
+  ├─ available_tools: Vec<SharedString>
+  ├─ worktrees: Vec<WorktreeContext>
+  ├─ os: String
+  ├─ shell: String
+  ├─ model_name: Option<String>
+  ├─ has_rules: bool
+  ├─ has_user_rules: bool
+  └─ user_rules: Vec<UserRulesContext>
+         │
+         ▼
+    Handlebars::render("system_prompt", &data)
+         │
+         ├─ Process conditionals: {{#if}}, {{#each}}
+         ├─ Interpolate variables: {{os}}, {{shell}}
+         ├─ Apply helpers: (gt), (len), (contains), (or)
+         └─ Escape only when needed (triple braces for raw: {{{text}}})
+         │
+         ▼
+    Complete System Prompt String
+```
+
+### Prompts Used
+
+1. **System Prompt Template** (`system_prompt.hbs`)
+   - Comprehensive agent instructions
+   - Dynamically includes project context
+   - Adapts based on tool availability
+
+### Data Sources
+
+| Data | Source | Purpose |
+|------|--------|---------|
+| Worktree info | Project's visible worktrees | File path validation, project structure |
+| Rules files | `.rules`, `CLAUDE.md`, etc. | Project-specific coding conventions |
+| User prompts | PromptStore default prompts | User preferences and instructions |
+| Available tools | Filtered tool list | Tool usage instructions |
+| OS/Shell | System information | Environment-specific commands |
+| Model name | Current language model | Model-specific capabilities |
+
+### Key Functions
+
+- `SystemPromptTemplate::render()` (templates.rs) - Template rendering
+- `Thread::build_request_messages()` (lines 1968-1990) - Data preparation
+- `NativeAgent::build_project_context()` - Context gathering
+- `Handlebars::render()` - Template engine
+
+---
+
