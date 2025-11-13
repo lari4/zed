@@ -209,3 +209,344 @@ StopReason::Refusal
 
 ---
 
+## Edit Agent Pipeline
+
+### Overview
+
+The Edit Agent handles direct file modifications through AI-generated edits. It supports two modes: editing existing files and creating new files from scratch. The agent parses streaming model output to extract edit instructions and applies them to buffers.
+
+**Primary File:** `crates/agent/src/edit_agent.rs`
+
+**Key Components:**
+- `EditAgent` - Manages edit operations
+- `EditParser` - Parses streaming edit instructions
+- `StreamingFuzzyMatcher` - Resolves old_text to buffer locations
+- `StreamingDiff` - Computes character-level diffs
+
+### Mode 1: Edit Existing File
+
+This mode modifies an existing file by matching old text and replacing it with new text.
+
+```
+┌─────────────────────────────────────┐
+│  User Request: Edit file           │
+│  - buffer: Entity<Buffer>          │
+│  - edit_description: String         │
+│  - conversation: previous context   │
+└────────┬────────────────────────────┘
+         │
+         ▼
+┌──────────────────────────────────────────────────────────┐
+│              EditAgent::edit()                           │
+│                                                          │
+│  1. Select edit format based on model:                  │
+│     ├─ Claude/GPT-4 -> EditFormat::XmlTags              │
+│     └─ Gemini -> EditFormat::DiffFenced                 │
+│                                                          │
+│  2. Render appropriate prompt template:                 │
+│     ├─ edit_file_prompt_xml.hbs (XML format)            │
+│     └─ edit_file_prompt_diff_fenced.hbs (diff format)   │
+│                                                          │
+│  3. Build model request:                                │
+│     ├─ Include previous conversation context            │
+│     ├─ Add edit prompt with file path                   │
+│     └─ Set CompletionIntent::EditFile                   │
+└────────┬─────────────────────────────────────────────────┘
+         │
+         ▼
+┌──────────────────────────────────────────────────────────┐
+│      model.stream_completion(request)                   │
+│      [STREAMING EDITS]                                   │
+└────────┬─────────────────────────────────────────────────┘
+         │
+         ▼
+┌────────────────────────────────────────────────────────────────┐
+│              apply_edit_chunks()                               │
+│                                                                │
+│  Three parallel streams:                                      │
+│                                                                │
+│  ┌──────────────────────────────────────────────────┐        │
+│  │  Stream 1: parse_edit_chunks()                   │        │
+│  │  (background thread)                             │        │
+│  │                                                  │        │
+│  │  Response chunks                                 │        │
+│  │       ↓                                          │        │
+│  │  EditParser::push_chunk()                        │        │
+│  │       ├─ XmlEditParser                           │        │
+│  │       │  States: Pending → WithinOldText →       │        │
+│  │       │         AfterOldText → WithinNewText     │        │
+│  │       │  Extracts: line hints, old/new text      │        │
+│  │       │                                          │        │
+│  │       └─ DiffFencedEditParser                    │        │
+│  │          States: Pending → WithinSearch →        │        │
+│  │                 WithinReplace                    │        │
+│  │       ↓                                          │        │
+│  │  Emit EditParserEvent:                           │        │
+│  │   ├─ OldTextChunk { chunk, done, line_hint }    │        │
+│  │   └─ NewTextChunk { chunk, done }               │        │
+│  └──────────────────────────────────────────────────┘        │
+│         │                                                     │
+│         ▼                                                     │
+│  ┌──────────────────────────────────────────────────┐        │
+│  │  Stream 2: resolve_old_text()                    │        │
+│  │  (foreground task)                               │        │
+│  │                                                  │        │
+│  │  For each old_text chunk:                        │        │
+│  │    ├─ StreamingFuzzyMatcher::match_against()    │        │
+│  │    │  - Searches buffer for matching text       │        │
+│  │    │  - Uses line hints to narrow search        │        │
+│  │    │  - Calculates fuzzy match scores           │        │
+│  │    │  - Reports candidates to UI:               │        │
+│  │    │    * ResolvingEditRange (refining)         │        │
+│  │    │    * AmbiguousEditRange (multiple matches) │        │
+│  │    │    * UnresolvedEditRange (no match)        │        │
+│  │    │                                             │        │
+│  │    └─ Returns:                                   │        │
+│  │       ├─ 0 matches -> Skip this edit            │        │
+│  │       ├─ 1 match -> Continue to diff             │        │
+│  │       └─ 2+ matches -> Report ambiguity, skip   │        │
+│  │                                                  │        │
+│  │  Output: Option<Range<usize>>                    │        │
+│  └──────────────────────────────────────────────────┘        │
+│         │                                                     │
+│         ▼                                                     │
+│  ┌──────────────────────────────────────────────────┐        │
+│  │  Stream 3: compute_edits()                       │        │
+│  │  (foreground task)                               │        │
+│  │                                                  │        │
+│  │  For each resolved range + new_text:             │        │
+│  │    ├─ Convert Range<usize> to Range<Anchor>     │        │
+│  │    ├─ StreamingDiff::new(old_text, new_text)    │        │
+│  │    │  - Character-level comparison               │        │
+│  │    │  - Generates edit operations                │        │
+│  │    │                                             │        │
+│  │    └─ Collect edits in batches of 32             │        │
+│  │       └─> Vec<(Range<Anchor>, String)>          │        │
+│  └──────────────────────────────────────────────────┘        │
+│         │                                                     │
+│         ▼                                                     │
+│  ┌──────────────────────────────────────────────────┐        │
+│  │  Apply Edit Batch                                │        │
+│  │                                                  │        │
+│  │  For each batch:                                 │        │
+│  │    ├─ buffer.edit(edits, None, cx)               │        │
+│  │    ├─ Log: action_log.buffer_edited()            │        │
+│  │    ├─ project.update_agent_location()            │        │
+│  │    └─ Emit EditAgentOutputEvent::Edited(range)   │        │
+│  └──────────────────────────────────────────────────┘        │
+└────────┬───────────────────────────────────────────────────────┘
+         │
+         ▼
+┌──────────────────────────────────────────────────────────┐
+│         Collect all edit events                         │
+│  - EditAgentOutputEvent::Edited for each edit           │
+│  - EditAgentOutputEvent::Finished with summary          │
+└────────┬─────────────────────────────────────────────────┘
+         │
+         ▼
+┌─────────────────┐
+│  Buffer Updated │
+│  UI Refreshed   │
+└─────────────────┘
+```
+
+### Mode 2: Create New File
+
+This mode creates a new file with AI-generated content from scratch.
+
+```
+┌─────────────────────────────────────┐
+│  User Request: Create file         │
+│  - buffer: Entity<Buffer>          │
+│  - edit_description: String         │
+└────────┬────────────────────────────┘
+         │
+         ▼
+┌──────────────────────────────────────────────────────────┐
+│            EditAgent::overwrite()                        │
+│                                                          │
+│  1. Render create_file_prompt.hbs:                      │
+│     ├─ file_path: path to new file                      │
+│     └─ edit_description: what to create                 │
+│                                                          │
+│  2. Build model request:                                │
+│     ├─ Add create prompt                                │
+│     ├─ Set CompletionIntent::CreateFile                 │
+│     └─ Disable tool calls                               │
+└────────┬─────────────────────────────────────────────────┘
+         │
+         ▼
+┌──────────────────────────────────────────────────────────┐
+│      model.stream_completion(request)                   │
+│      [STREAMING FILE CONTENT]                            │
+└────────┬─────────────────────────────────────────────────┘
+         │
+         ▼
+┌──────────────────────────────────────────────────────────┐
+│            CreateFileParser                              │
+│                                                          │
+│  States:                                                 │
+│    Pending → WithinCodeBlock → Complete                 │
+│                                                          │
+│  Processing:                                             │
+│    ├─ Detect opening ``` marker                         │
+│    ├─ Accumulate file content                           │
+│    └─ Detect closing ``` marker                         │
+│                                                          │
+│  Emit: FileContentChunk events                          │
+└────────┬─────────────────────────────────────────────────┘
+         │
+         ▼
+┌──────────────────────────────────────────────────────────┐
+│         Apply File Content                              │
+│                                                          │
+│  1. Clear buffer: buffer.edit([(0..text.len(), "")])    │
+│  2. Insert content: buffer.edit([(0..0, new_content)])  │
+│  3. Log: action_log.buffer_created()                    │
+│  4. Emit EditAgentOutputEvent::Finished                 │
+└────────┬─────────────────────────────────────────────────┘
+         │
+         ▼
+┌─────────────────┐
+│  File Created   │
+│  UI Refreshed   │
+└─────────────────┘
+```
+
+### Edit Format Comparison
+
+#### XML Tags Format (edit_file_prompt_xml.hbs)
+
+**Prompt Structure:**
+- Instructions for using `<old_text>` and `<new_text>` tags
+- Line number hints via `line` attribute
+- Example showing proper format
+
+**Model Output Example:**
+```xml
+<edits>
+
+<old_text line=10>
+function calculateTotal() {
+    return price * quantity;
+}
+</old_text>
+<new_text>
+function calculateTotal() {
+    const tax = 0.08;
+    return price * quantity * (1 + tax);
+}
+</new_text>
+
+</edits>
+```
+
+**Parser:** `XmlEditParser` (edit_parser.rs lines 142-250)
+- Uses regex to extract line hints: `line="?(\d+)"`
+- States track position in XML structure
+- Emits chunks as text is parsed
+
+#### Diff Fenced Format (edit_file_prompt_diff_fenced.hbs)
+
+**Prompt Structure:**
+- Instructions for SEARCH/REPLACE diff format
+- Git-style conflict markers
+- Example with multiple hunks
+
+**Model Output Example:**
+```
+<<<<<<< SEARCH line=10
+function calculateTotal() {
+    return price * quantity;
+}
+=======
+function calculateTotal() {
+    const tax = 0.08;
+    return price * quantity * (1 + tax);
+}
+>>>>>>> REPLACE
+```
+
+**Parser:** `DiffFencedEditParser` (edit_parser.rs lines 252+)
+- Detects `<<<<<<< SEARCH` and `>>>>>>> REPLACE` markers
+- Extracts line hints from SEARCH line
+- States track position in diff block
+
+### Fuzzy Matching Algorithm
+
+The `StreamingFuzzyMatcher` resolves old_text to buffer locations:
+
+```
+Old Text Chunks (streaming)
+         │
+         ▼
+┌─────────────────────────────────────────┐
+│  StreamingFuzzyMatcher                  │
+│                                         │
+│  Accumulate chunks into full old_text  │
+│         │                               │
+│         ▼                               │
+│  Search buffer for candidates:          │
+│    ├─ If line_hint provided:           │
+│    │  └─ Search within ±50 lines       │
+│    └─ Otherwise: search full buffer    │
+│         │                               │
+│         ▼                               │
+│  Score each candidate:                  │
+│    ├─ Exact match: score = 1.0         │
+│    └─ Fuzzy match: Levenshtein score   │
+│         │                               │
+│         ▼                               │
+│  Filter and rank:                       │
+│    ├─ Keep scores > threshold          │
+│    └─ Sort by score (highest first)    │
+│         │                               │
+│         ▼                               │
+│  Report results:                        │
+│    ├─ 0 matches: UnresolvedEditRange   │
+│    ├─ 1 match: Single Range<usize>     │
+│    └─ 2+ matches: AmbiguousEditRange   │
+└─────────────────────────────────────────┘
+```
+
+### Prompts Used
+
+1. **Edit File (XML)** (`edit_file_prompt_xml.hbs`)
+   - Used for Claude and GPT models
+   - Provides XML tag-based edit format
+   - Includes line number hints
+
+2. **Edit File (Diff)** (`edit_file_prompt_diff_fenced.hbs`)
+   - Used for Gemini models
+   - Provides Git-style diff format
+   - Includes SEARCH/REPLACE blocks
+
+3. **Create File** (`create_file_prompt.hbs`)
+   - Used for new file creation
+   - Expects triple-backtick wrapped content
+   - Tool calls disabled
+
+### Data Transformations
+
+| From | To | Transformation |
+|------|-----|----------------|
+| User edit description | Rendered prompt | Template rendering with path and description |
+| Model response chunks | Edit events | Parser extracts old_text and new_text |
+| Old text chunks | Buffer range | Fuzzy matching resolves to Range<usize> |
+| Range<usize> | Range<Anchor> | Conversion for stable references |
+| Old + new text | Edit operations | StreamingDiff computes character-level changes |
+| Edit operations | Buffer updates | `buffer.edit()` applies changes |
+
+### Key Functions
+
+- `EditAgent::edit()` (lines 216-250) - Entry point for file edits
+- `EditAgent::overwrite()` (lines 103-135) - Entry point for file creation
+- `apply_edit_chunks()` (lines 255-385) - Orchestrates three-stream processing
+- `parse_edit_chunks()` (lines 387-420) - Background parsing of model output
+- `resolve_old_text()` (lines 274-328) - Fuzzy matching to resolve locations
+- `compute_edits()` (lines 332-381) - Diff computation for edits
+- `EditParser::push_chunk()` - Parser state machine for extracting edits
+- `StreamingFuzzyMatcher::match_against_snapshot()` - Fuzzy text matching
+
+---
+
